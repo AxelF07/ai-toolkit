@@ -1,6 +1,5 @@
 from functools import partial
 import os
-import gc
 from typing import Any, Dict, Optional, Union, List
 from typing_extensions import Self
 import torch
@@ -212,6 +211,12 @@ class Wan2214bModel(Wan21):
         if not self.train_high_noise or not self.train_low_noise:
             self.target_lora_modules = ["WanTransformer3DModel"]
 
+    def get_quantization_exclude_modules(self):
+        # the timestep/text conditioning embedders and the final projection feed
+        # every downstream modulation; keep them in full precision when quantizing.
+        # names are relative to each individual transformer (they quantize separately)
+        return ["condition_embedder*", "proj_out*"]
+
     @property
     def max_step_saves_to_keep_multiplier(self):
         # the cleanup mechanism checks this to see how many saves to keep
@@ -239,10 +244,6 @@ class Wan2214bModel(Wan21):
         self.model.transformer_2.condition_embedder.forward = partial(
             time_text_monkeypatch, self.model.transformer_2.condition_embedder
         )
-        
-        # Enable flash attention if requested
-        if self.model_config.model_kwargs.get('use_flash_attention', False):
-            self.enable_flash_attention()
 
     def get_bucket_divisibility(self):
         # 8x compression  and 2x2 patch size
@@ -286,21 +287,11 @@ class Wan2214bModel(Wan21):
 
         self.print_and_status_update("Loading transformer 1")
         dtype = self.torch_dtype
-        # Use device context to ensure loading happens on GPU for ROCm
-        with torch.device(self.device_torch if not self.model_config.low_vram else 'cpu'):
-            transformer_1 = WanTransformer3DModel.from_pretrained(
-                transformer_path_1,
-                subfolder=subfolder_1,
-                torch_dtype=dtype,
-                device_map=None,
-            )
-        # Immediately move to GPU on ROCm to prevent transformers from keeping it on CPU
-        if not self.model_config.low_vram:
-            transformer_1 = transformer_1.to(self.device_torch, dtype=dtype)
-            # Force garbage collection to free CPU memory after moving to GPU
-            gc.collect()
-        else:
-            transformer_1 = transformer_1.to(dtype=dtype)
+        transformer_1 = WanTransformer3DModel.from_pretrained(
+            transformer_path_1,
+            subfolder=subfolder_1,
+            torch_dtype=dtype,
+        ).to(dtype=dtype)
 
         flush()
 
@@ -326,21 +317,11 @@ class Wan2214bModel(Wan21):
 
         self.print_and_status_update("Loading transformer 2")
         dtype = self.torch_dtype
-        # Use device context to ensure loading happens on GPU for ROCm
-        with torch.device(self.device_torch if not self.model_config.low_vram else 'cpu'):
-            transformer_2 = WanTransformer3DModel.from_pretrained(
-                transformer_path_2,
-                subfolder=subfolder_2,
-                torch_dtype=dtype,
-                device_map=None,
-            )
-        # Immediately move to GPU on ROCm to prevent transformers from keeping it on CPU
-        if not self.model_config.low_vram:
-            transformer_2 = transformer_2.to(self.device_torch, dtype=dtype)
-            # Force garbage collection to free CPU memory after moving to GPU
-            gc.collect()
-        else:
-            transformer_2 = transformer_2.to(dtype=dtype)
+        transformer_2 = WanTransformer3DModel.from_pretrained(
+            transformer_path_2,
+            subfolder=subfolder_2,
+            torch_dtype=dtype,
+        ).to(dtype=dtype)
 
         flush()
 
@@ -574,6 +555,11 @@ class Wan2214bModel(Wan21):
     ):
         # reactivate progress bar since this is slooooow
         pipeline.set_progress_bar_config(disable=False)
+
+        if self.use_vae_tiling:
+            # set vae to tile decode
+            pipeline.vae.enable_tiling()
+
         # todo, figure out how to do video
         output = pipeline(
             prompt_embeds=conditional_embeds.text_embeds.to(
@@ -591,6 +577,10 @@ class Wan2214bModel(Wan21):
             output_type="pil",
             **extra
         )[0]
+
+        if self.use_vae_tiling:
+            # restore no tiling
+            pipeline.vae.disable_tiling()
 
         # shape = [1, frames, channels, height, width]
         batch_item = output[0]  # list of pil images
