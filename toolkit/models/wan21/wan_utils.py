@@ -22,19 +22,6 @@ def add_first_frame_conditioning(
     dtype = latent_model_input.dtype
     vae_scale_factor_temporal = 2 ** sum(vae.temperal_downsample)
 
-    # Ensure VAE is on the correct device before encoding
-    # This is critical for ROCm/CUDA compatibility and memory management
-    vae_device = next(vae.parameters()).device
-    vae_was_on_cpu = vae_device.type == 'cpu'
-    vae_was_training = vae.training if hasattr(vae, 'training') else False
-    
-    if vae_was_on_cpu or vae_device != device:
-        vae.to(device)
-    
-    # Ensure VAE is in eval mode for encoding (critical for stability)
-    vae.eval()
-    vae.requires_grad_(False)
-
     # Get number of frames from latent model input
     _, _, num_latent_frames, _, _ = latent_model_input.shape
 
@@ -60,69 +47,34 @@ def add_first_frame_conditioning(
         align_corners=False
     )
 
-    # Optimize: Encode just the first frame, then replicate it
-    # This is more memory-efficient than encoding the entire video sequence with zeros
-    # Add temporal dimension to first frame for VAE encoding
-    first_frame_for_encode = first_frame.unsqueeze(2)  # (bs, channels, 1, height, width)
-    first_frame_for_encode = first_frame_for_encode.to(device, dtype=dtype)
+    # Add temporal dimension to first frame
+    first_frame = first_frame.unsqueeze(2)
 
-    # Encode with VAE (VAE is now guaranteed to be on the correct device)
-    # Use no_grad to save memory and prevent gradient issues during encoding
-    with torch.no_grad():
-        try:
-            # Encode just the first frame (more efficient than encoding full video)
-            first_frame_latent = vae.encode(first_frame_for_encode).latent_dist.sample()
-            # Synchronize on ROCm/HIP to catch errors immediately
-            if device.type in ['cuda', 'hip']:
-                torch.cuda.synchronize(device)
-        except RuntimeError as e:
-            # If encoding fails, provide more context for debugging
-            raise RuntimeError(
-                f"VAE encoding failed during first frame conditioning. "
-                f"Device: {device}, VAE device: {next(vae.parameters()).device}, "
-                f"First frame shape: {first_frame_for_encode.shape}, dtype: {first_frame_for_encode.dtype}, "
-                f"First frame range: [{first_frame_for_encode.min().item():.3f}, {first_frame_for_encode.max().item():.3f}]. "
-                f"Original error: {e}"
-            ) from e
+    # Create video condition with first frame and zeros for remaining frames
+    zero_frame = torch.zeros_like(first_frame)
+    video_condition = torch.cat([
+        first_frame,
+        *[zero_frame for _ in range(num_frames - 1)]
+    ], dim=2)
+
+    # Prepare for VAE encoding (bs, channels, num_frames, height, width)
+    # video_condition = video_condition.permute(0, 2, 1, 3, 4)
+
+    # Encode with VAE
+    latent_condition = vae.encode(
+        video_condition.to(device, dtype)
+    ).latent_dist.sample()
+    latent_condition = latent_condition.to(device, dtype)
     
-    # Replicate the first frame latent to match the number of frames needed
-    # first_frame_latent shape: (bs, z_dim, 1, latent_h, latent_w)
-    # We need: (bs, z_dim, num_latent_frames, latent_h, latent_w)
-    # Use expand (memory-efficient) instead of repeat
-    latent_condition = first_frame_latent.expand(-1, -1, num_latent_frames, -1, -1)
-    
-    # Ensure correct dtype (should already be on correct device from VAE encoding)
-    latent_condition = latent_condition.to(dtype=dtype)
-    
-    # Synchronize to catch any async errors
-    if device.type in ['cuda', 'hip']:
-        torch.cuda.synchronize(device)
-    
-    # Move VAE back to CPU if it was there before (to save memory)
-    # Restore training mode if it was training before
-    if vae_was_on_cpu:
-        vae.to('cpu')
-    if vae_was_training:
-        vae.train()
-    
-    # Create mean and std tensors on CPU first, then move to device (safer for ROCm)
-    latents_mean = torch.tensor(
-        vae.config.latents_mean,
-        device=device,
-        dtype=dtype
-    ).view(1, vae.config.z_dim, 1, 1, 1)
-    
-    latents_std = 1.0 / torch.tensor(
-        vae.config.latents_std,
-        device=device,
-        dtype=dtype
-    ).view(1, vae.config.z_dim, 1, 1, 1)
-    
+    latents_mean = (
+        torch.tensor(vae.config.latents_mean)
+        .view(1, vae.config.z_dim, 1, 1, 1)
+        .to(device, dtype)
+    )
+    latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(1, vae.config.z_dim, 1, 1, 1).to(
+        device, dtype
+    )
     latent_condition = (latent_condition - latents_mean) * latents_std
-    
-    # Synchronize after computation to catch any async errors
-    if device.type in ['cuda', 'hip']:
-        torch.cuda.synchronize(device)
     
 
     # Create mask: 1 for conditioning frames, 0 for frames to generate
@@ -163,9 +115,10 @@ def add_first_frame_conditioning(
 
 def add_first_frame_conditioning_v22(
     latent_model_input,
-    first_frame,
-    vae,
-    last_frame=None
+    first_frame=None,
+    vae=None,
+    last_frame=None,
+    first_frame_latents=None,
 ):
     """
     Overwrites first few time steps in latent_model_input with VAE-encoded first_frame,
@@ -175,6 +128,8 @@ def add_first_frame_conditioning_v22(
         latent_model_input: torch.Tensor of shape (bs, 48, T, H, W)
         first_frame: torch.Tensor of shape (bs, 3, H*scale, W*scale)
         vae: VAE model with .encode() and .config.latents_mean/std
+        first_frame_latents: optional pre-encoded, normalized first frame latents of
+            shape (bs, 48, 1, H, W); skips the VAE encode when provided
 
     Returns:
         latent: (bs, 48, T, H, W) - modified input latent
@@ -187,21 +142,30 @@ def add_first_frame_conditioning_v22(
     target_h = H * scale
     target_w = W * scale
 
-    # Ensure shape
-    if first_frame.ndim == 3:
-        first_frame = first_frame.unsqueeze(0)
-    if first_frame.shape[0] != bs:
-        first_frame = first_frame.expand(bs, -1, -1, -1)
-
-    # Resize and encode
-    first_frame_up = F.interpolate(first_frame, size=(target_h, target_w), mode="bilinear", align_corners=False)
-    first_frame_up = first_frame_up.unsqueeze(2)  # (bs, 3, 1, H, W)
-    encoded = vae.encode(first_frame_up).latent_dist.sample().to(dtype).to(device)
-
-    # Normalize
     mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(device, dtype)
     std = 1.0 / torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(device, dtype)
-    encoded = (encoded - mean) * std
+
+    if first_frame_latents is not None:
+        # cached latents are already encoded and normalized
+        encoded = first_frame_latents.to(device, dtype)
+        if encoded.ndim == 4:
+            encoded = encoded.unsqueeze(0)
+        if encoded.shape[0] != bs:
+            encoded = encoded.expand(bs, -1, -1, -1, -1)
+    else:
+        # Ensure shape
+        if first_frame.ndim == 3:
+            first_frame = first_frame.unsqueeze(0)
+        if first_frame.shape[0] != bs:
+            first_frame = first_frame.expand(bs, -1, -1, -1)
+
+        # Resize and encode
+        first_frame_up = F.interpolate(first_frame, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        first_frame_up = first_frame_up.unsqueeze(2)  # (bs, 3, 1, H, W)
+        encoded = vae.encode(first_frame_up).latent_dist.sample().to(dtype).to(device)
+
+        # Normalize
+        encoded = (encoded - mean) * std
 
     # Replace in latent
     latent = latent_model_input.clone()
